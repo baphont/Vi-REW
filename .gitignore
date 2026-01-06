@@ -1,3 +1,10 @@
 Vi-REW.spec
 version_info.txt
 temp-audio.m4a
+build/Vi-REW/base_library.zip
+build/Vi-REW/Analysis-00.toc
+/build/Vi-REW/localpycs
+/build
+/dist
+Vi-REW-Pro.spec
+Vi-REW Pro.spec
