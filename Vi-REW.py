@@ -1,6 +1,6 @@
 import sys
 import os
-import time
+import subprocess
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QFrame,
     QHBoxLayout, QVBoxLayout, QPushButton, QCheckBox, 
@@ -9,10 +9,11 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, QObject, Signal, Slot
 from PySide6.QtGui import QColor, QIcon
 
-# --- 導入 MoviePy 與 Proglog ---
+# --- 導入 MoviePy 與相關套件 ---
 from moviepy import VideoFileClip, concatenate_videoclips
 from moviepy import vfx
 from proglog import ProgressBarLogger 
+import imageio_ffmpeg # 用來查找 ffmpeg 路徑
 
 # --- [UI Logger] ---
 class QtLogger(ProgressBarLogger):
@@ -24,7 +25,6 @@ class QtLogger(ProgressBarLogger):
     def callback(self, **changes):
         if 'message' in changes:
             msg = changes['message']
-            # print(f"[系統訊息] {msg}") # Debug用，打包時可註解
             self.message_signal.emit(msg)
 
     def bars_callback(self, bar, attr, value, old_value=None):
@@ -32,11 +32,11 @@ class QtLogger(ProgressBarLogger):
             total = self.bars[bar]['total']
             if total > 0:
                 percentage = int((value / total) * 100)
-                # sys.stdout.write(f"\r[進度] {percentage}%") # Debug用
-                # sys.stdout.flush()
                 self.progress_signal.emit(percentage)
 
-# --- 影片處理核心 (高畫質 + 防卡死) ---
+# --- 影片處理核心 (GPU 加速 + 防卡死) ---
+# --- 影片處理核心 (GPU 加速 + 路徑修正 + 參數修復) ---
+# --- 影片處理核心 (全方位 GPU 支援: NVIDIA / Intel / AMD) ---
 class VideoReverseWorker(QObject):
     finished = Signal(str)      
     error = Signal(str)         
@@ -48,6 +48,28 @@ class VideoReverseWorker(QObject):
         self.file_path = file_path
         self.is_boomerang = is_boomerang
 
+    def detect_hardware_encoder(self, ffmpeg_path):
+        """
+        偵測可用的硬體編碼器
+        回傳: 'nvidia', 'intel', 'amd', 或 None
+        """
+        if not ffmpeg_path: return None
+        try:
+            # 查詢所有可用的編碼器
+            result = subprocess.run([ffmpeg_path, "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            output = result.stdout
+            
+            # 優先順序: NVIDIA > AMD > Intel (通常獨顯效能 > 內顯)
+            if "h264_nvenc" in output:
+                return "nvidia"
+            elif "h264_amf" in output:
+                return "amd"
+            elif "h264_qsv" in output:
+                return "intel"
+        except Exception:
+            return None
+        return None
+
     @Slot()
     def run(self):
         temp_reversed_path = None
@@ -56,18 +78,58 @@ class VideoReverseWorker(QObject):
         final_clip = None
         temp_audio_name = "temp-audio.m4a"
 
-        # [設定] 高畫質參數 (CRF 18 = 視覺無損)
-        # 如果覺得檔案太大，可以改回 23 (預設)
-        # 如果想要完全無損 (檔案巨大)，可以改 0
-        hq_params = ['-crf', '18'] 
-
         try:
-            self.progress_msg.emit("正在載入影片...")
+            self.progress_msg.emit("正在初始化並偵測硬體...")
             self.progress_val.emit(0)
+
+            # 1. 取得並設定 FFmpeg
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+            if ffmpeg_path is None:
+                raise Exception("找不到 FFmpeg")
+            os.environ["FFMPEG_BINARY"] = ffmpeg_path
+            print(f"[系統訊息] FFmpeg 路徑: {ffmpeg_path}")
+
+            # --- 2. 智慧型硬體偵測與參數配置 ---
+            gpu_type = self.detect_hardware_encoder(ffmpeg_path)
             
+            target_codec = ""
+            target_preset = ""
+            target_params = []
+
+            if gpu_type == "nvidia":
+                self.progress_msg.emit("偵測到 NVIDIA GPU (NVENC)")
+                print("[系統訊息] 模式: NVIDIA GPU 加速 (h264_nvenc)")
+                target_codec = "h264_nvenc"
+                target_preset = "p6" # 慢速高品質
+                target_params = ['-cq', '20', '-rc', 'vbr'] # VBR 模式
+
+            elif gpu_type == "amd":
+                self.progress_msg.emit("偵測到 AMD GPU (AMF)")
+                print("[系統訊息] 模式: AMD GPU 加速 (h264_amf)")
+                target_codec = "h264_amf"
+                target_preset = "quality" # AMD 的高品質預設值
+                # AMD 使用 CQP (Constant Quantization Parameter) 控制畫質
+                target_params = ['-rc', 'cqp', '-qp_p', '20', '-qp_i', '20']
+
+            elif gpu_type == "intel":
+                self.progress_msg.emit("偵測到 Intel 內顯 (QuickSync)")
+                print("[系統訊息] 模式: Intel QSV 加速 (h264_qsv)")
+                target_codec = "h264_qsv"
+                target_preset = "medium" # QSV 建議用標準 preset
+                # Intel 使用 global_quality 控制畫質 (數值越小畫質越好)
+                target_params = ['-global_quality', '20', '-look_ahead', '1']
+
+            else:
+                self.progress_msg.emit("未偵測到支援的 GPU，使用 CPU 高畫質")
+                print("[系統訊息] 模式: CPU 軟體編碼 (libx264)")
+                target_codec = "libx264"
+                target_preset = "medium"
+                target_params = ['-crf', '18'] # 視覺無損
+
+            # --- 3. 處理流程 (通用) ---
+            self.progress_msg.emit("正在載入影片...")
             original_clip = VideoFileClip(self.file_path)
             
-            # 安全修剪
             if original_clip.duration > 0.1:
                 new_duration = original_clip.duration - 0.05
                 original_clip = original_clip.with_section_cut_out(new_duration, original_clip.duration)
@@ -78,60 +140,41 @@ class VideoReverseWorker(QObject):
             base_name = os.path.splitext(self.file_path)[0]
             my_logger = QtLogger(self.progress_val, self.progress_msg)
 
-            if self.is_boomerang:
-                self.progress_msg.emit("正在生成倒轉暫存檔 (高畫質)...")
-                temp_reversed_path = base_name + "_temp_rev.mp4"
-                
-                # 寫入暫存檔 (也要用高畫質，不然畫質會先爛一次)
-                reversed_clip.write_videofile(
-                    temp_reversed_path, 
-                    codec="libx264", 
+            # 寫入檔案的函數 (封裝重複邏輯)
+            def write_clip(clip, path):
+                clip.write_videofile(
+                    path, 
+                    codec=target_codec, 
                     audio_codec="aac",
                     temp_audiofile=temp_audio_name,
                     remove_temp=True,
                     threads=4,
-                    preset="medium",   
-                    ffmpeg_params=hq_params,  # <--- 加入高畫質參數
+                    preset=target_preset,
+                    ffmpeg_params=target_params,
                     logger=my_logger
                 )
+
+            if self.is_boomerang:
+                self.progress_msg.emit(f"正在生成暫存檔 ({gpu_type if gpu_type else 'CPU'})...")
+                temp_reversed_path = base_name + "_temp_rev.mp4"
+                write_clip(reversed_clip, temp_reversed_path)
                 
                 rev_clip_disk = VideoFileClip(temp_reversed_path)
                 
-                self.progress_msg.emit("正在合併影片 (Boomerang)...")
+                self.progress_msg.emit(f"正在合併影片 ({gpu_type if gpu_type else 'CPU'})...")
                 final_clip = concatenate_videoclips([original_clip, rev_clip_disk])
                 
                 output_path = base_name + "_boomerang.mp4"
-                
-                # 輸出最終檔
-                final_clip.write_videofile(
-                    output_path, 
-                    codec="libx264", 
-                    audio_codec="aac", 
-                    temp_audiofile=temp_audio_name,
-                    remove_temp=True,
-                    threads=4,
-                    ffmpeg_params=hq_params, # <--- 加入高畫質參數
-                    logger=my_logger
-                )
+                write_clip(final_clip, output_path)
                 
                 rev_clip_disk.close()
                 
             else:
                 output_path = base_name + "_REW.mp4"
-                self.progress_msg.emit("正在輸出倒轉影片 (高畫質)...")
-                
-                reversed_clip.write_videofile(
-                    output_path, 
-                    codec="libx264", 
-                    audio_codec="aac", 
-                    temp_audiofile=temp_audio_name,
-                    remove_temp=True,
-                    threads=4,
-                    ffmpeg_params=hq_params, # <--- 加入高畫質參數
-                    logger=my_logger
-                )
+                self.progress_msg.emit(f"正在輸出倒轉影片 ({gpu_type if gpu_type else 'CPU'})...")
+                write_clip(reversed_clip, output_path)
 
-            # 資源清理
+            # 清理
             if original_clip: original_clip.close()
             if reversed_clip: reversed_clip.close()
             if final_clip: final_clip.close()
@@ -144,6 +187,8 @@ class VideoReverseWorker(QObject):
             self.finished.emit(output_path)
 
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self.error.emit(f"處理失敗: {str(e)}")
             
         finally:
@@ -151,12 +196,13 @@ class VideoReverseWorker(QObject):
                 if original_clip: original_clip.close()
             except: pass
 
+
 # --- UI (保持不變) ---
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-        self.setWindowTitle("Vi-REW 1.0 (High Quality)")
+        self.setWindowTitle("Vi-REW 1.0 (GPU Enabled)")
         self.setGeometry(100, 100, 600, 480)
         self.setAcceptDrops(True)
         self.thread = None
@@ -204,7 +250,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.info_panel, 1)
 
         options_layout = QHBoxLayout()
-        self.boomerang_check = QCheckBox("串接原檔 (用於製作一些動態背景，可保持首尾幀連貫)")
+        self.boomerang_check = QCheckBox("串接原檔 (Boomerang 效果)")
         self.boomerang_check.setChecked(False) 
         options_layout.addWidget(self.boomerang_check)
         options_layout.addStretch()
