@@ -9,8 +9,8 @@ from PySide6.QtWidgets import (
     QFileDialog, QStyle, QMessageBox, QProgressBar,
     QSlider, QGroupBox, QSizePolicy
 )
-from PySide6.QtCore import Qt, QThread, QObject, Signal, Slot, QTimer, QSize
-from PySide6.QtGui import QImage, QPixmap, QAction, QIcon, QKeySequence, QShortcut
+from PySide6.QtCore import Qt, QThread, QObject, Signal, Slot, QTimer
+from PySide6.QtGui import QImage, QPixmap, QKeySequence, QShortcut
 
 # --- MoviePy 1.0.3 引用 ---
 from moviepy.editor import VideoFileClip, concatenate_videoclips, vfx
@@ -30,10 +30,12 @@ class QtLogger(ProgressBarLogger):
 
     def bars_callback(self, bar, attr, value, old_value=None):
         if bar in ['t', 'index', 'frame_index']:
-            total = self.bars[bar]['total']
-            if total > 0:
-                percentage = int((value / total) * 100)
-                self.progress_signal.emit(percentage)
+            # 加強保護：避免 bar 不存在時報錯
+            if bar in self.bars:
+                total = self.bars[bar]['total']
+                if total > 0:
+                    percentage = int((value / total) * 100)
+                    self.progress_signal.emit(percentage)
 
 # --- 影片處理核心 ---
 class VideoReverseWorker(QObject):
@@ -50,18 +52,6 @@ class VideoReverseWorker(QObject):
         self.end_frame = end_frame
         self.fps = fps
 
-    def detect_hardware_encoder(self, ffmpeg_path):
-        if not ffmpeg_path: return None
-        try:
-            result = subprocess.run([ffmpeg_path, "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            output = result.stdout
-            if "h264_nvenc" in output: return "nvidia"
-            elif "h264_amf" in output: return "amd"
-            elif "h264_qsv" in output: return "intel"
-        except Exception:
-            return None
-        return None
-
     @Slot()
     def run(self):
         temp_reversed_path = None
@@ -75,54 +65,49 @@ class VideoReverseWorker(QObject):
             self.progress_msg.emit("初始化處理引擎...")
             self.progress_val.emit(0)
 
+            # 1. 確保 FFmpeg 路徑正確
             ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
             os.environ["FFMPEG_BINARY"] = ffmpeg_path
             
+            # 2. 核心數設定
             cpu_cores = os.cpu_count() or 4
-            gpu_type = self.detect_hardware_encoder(ffmpeg_path)
             
+            # --- [修正] 移除不穩定的硬體偵測，改用最穩定的通用設定 ---
+            # 這是 Windows 相容性最好、且絕不會因為驅動程式報錯的設定
             target_codec = "libx264"
-            target_preset = "ultrafast"
+            target_preset = "ultrafast" # 速度優先
             target_params = ['-crf', '18', '-pix_fmt', 'yuv420p']
 
-            if gpu_type == "nvidia":
-                self.progress_msg.emit("使用 NVIDIA 硬體加速")
-                target_codec = "h264_nvenc"
-                target_preset = "p1"
-                target_params = ['-rc', 'constqp', '-qp', '18', '-zerolatency', '1', '-pix_fmt', 'yuv420p']
-            elif gpu_type == "amd":
-                self.progress_msg.emit("使用 AMD 硬體加速")
-                target_codec = "h264_amf"
-                target_preset = "speed"
-                target_params = ['-rc', 'cqp', '-qp_p', '18', '-qp_i', '18', '-usage', 'ultralowlatency', '-pix_fmt', 'yuv420p']
-            elif gpu_type == "intel":
-                self.progress_msg.emit("使用 Intel QSV 硬體加速")
-                target_codec = "h264_qsv"
-                target_preset = "veryfast"
-                target_params = ['-global_quality', '18', '-pix_fmt', 'yuv420p']
-
             self.progress_msg.emit("讀取原始影片...")
+            if not os.path.exists(self.file_path):
+                raise FileNotFoundError(f"找不到檔案: {self.file_path}")
+
             original_clip = VideoFileClip(self.file_path)
             
-            # 轉換幀數為秒數
+            # 轉換幀數為秒數 (加強除錯保護)
+            if self.fps <= 0: self.fps = 30.0
+            
             s_time = self.start_frame / self.fps
             e_time = self.end_frame / self.fps
             
+            # 時間邊界修正
             if e_time > original_clip.duration: e_time = original_clip.duration
             if s_time < 0: s_time = 0
             
             if s_time > 0 or e_time < original_clip.duration:
-                self.progress_msg.emit(f"裁切: {s_time:.2f}s - {e_time:.2f}s")
+                self.progress_msg.emit(f"執行裁切: {s_time:.2f}s - {e_time:.2f}s")
+                # 使用 subclip 安全裁切
                 trimmed_clip = original_clip.subclip(s_time, e_time)
             else:
                 trimmed_clip = original_clip
 
-            self.progress_msg.emit("計算倒轉...")
+            self.progress_msg.emit("計算倒轉特效...")
             reversed_clip = trimmed_clip.fx(vfx.time_mirror)
 
             base_name = os.path.splitext(self.file_path)[0]
             my_logger = QtLogger(self.progress_val, self.progress_msg)
 
+            # 統一寫入函式
             def write_clip(clip, path):
                 clip.write_videofile(
                     path, codec=target_codec, audio_codec="aac",
@@ -132,12 +117,13 @@ class VideoReverseWorker(QObject):
                 )
 
             if self.is_boomerang:
-                self.progress_msg.emit("生成暫存檔...")
+                self.progress_msg.emit("生成暫存檔 (Boomerang)...")
                 temp_reversed_path = base_name + "_temp_rev.mp4"
                 write_clip(reversed_clip, temp_reversed_path)
                 
+                # 重新讀取暫存檔 (避免記憶體錯誤)
                 rev_clip_disk = VideoFileClip(temp_reversed_path)
-                self.progress_msg.emit("合併影片...")
+                self.progress_msg.emit("合併 正向+倒轉...")
                 final_clip = concatenate_videoclips([trimmed_clip, rev_clip_disk])
                 
                 output_path = base_name + "_boomerang.mp4"
@@ -145,13 +131,15 @@ class VideoReverseWorker(QObject):
                 rev_clip_disk.close()
             else:
                 output_path = base_name + "_REW.mp4"
-                self.progress_msg.emit("輸出影片...")
+                self.progress_msg.emit("輸出倒轉影片...")
                 write_clip(reversed_clip, output_path)
 
+            # 資源清理
             if original_clip: original_clip.close()
             if trimmed_clip and trimmed_clip != original_clip: trimmed_clip.close()
             if reversed_clip: reversed_clip.close()
             if final_clip: final_clip.close()
+            
             if temp_reversed_path and os.path.exists(temp_reversed_path):
                 try: os.remove(temp_reversed_path)
                 except: pass
@@ -160,6 +148,7 @@ class VideoReverseWorker(QObject):
             self.finished.emit(output_path)
 
         except Exception as e:
+            # 印出完整錯誤堆疊，方便除錯
             import traceback
             traceback.print_exc()
             self.error.emit(f"錯誤: {str(e)}")
@@ -173,7 +162,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-        self.setWindowTitle("Vi-REW Pro")
+        self.setWindowTitle("Vi-REW Pro (穩定版)")
         self.setGeometry(100, 100, 700, 800)
         self.setAcceptDrops(True)
         
@@ -211,12 +200,21 @@ class MainWindow(QMainWindow):
             QLabel#TimeCode {{ font-family: "Consolas", monospace; font-size: 14px; font-weight: bold; color: #FFF; }}
             QProgressBar {{ border: 1px solid #3E3E42; border-radius: 4px; text-align: center; color: white; }}
             QProgressBar::chunk {{ background-color: #4CAF50; }}
+            QLabel a {{ color: #4CAF50; text-decoration: none; }}
         """)
         
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         layout.setSpacing(10)
+
+        # 0. 連結
+        top_bar_label = QLabel()
+        top_bar_label.setTextFormat(Qt.TextFormat.RichText)
+        top_bar_label.setOpenExternalLinks(True)
+        top_bar_label.setText('<a href="https://linktr.ee/tori.kira" style="color: #4CAF50; text-decoration: none; font-weight:bold;">https://linktr.ee/tori.kira</a>')
+        top_bar_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        layout.addWidget(top_bar_label)
 
         # 1. 預覽視窗
         self.preview_label = QLabel("請拖曳影片至此載入")
@@ -245,13 +243,12 @@ class MainWindow(QMainWindow):
         # 滑桿
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setEnabled(False)
-        self.slider.valueChanged.connect(self.on_slider_move) # 修改連接函數以避免播放衝突
+        self.slider.valueChanged.connect(self.on_slider_move) 
         cp_layout.addWidget(self.slider)
         
-        # 按鈕區 (播放控制 + 剪輯)
+        # 按鈕區
         btn_area_layout = QHBoxLayout()
         
-        # 播放按鈕
         self.play_btn = QPushButton()
         self.play_btn.setObjectName("PlayBtn")
         self.play_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
@@ -259,17 +256,14 @@ class MainWindow(QMainWindow):
         self.play_btn.clicked.connect(self.toggle_playback)
         self.play_btn.setEnabled(False)
         
-        # 空白鍵快捷鍵
         self.shortcut_space = QShortcut(QKeySequence("Space"), self)
         self.shortcut_space.activated.connect(self.toggle_playback)
 
-        # 逐幀
         self.btn_prev = QPushButton("<")
         self.btn_prev.clicked.connect(lambda: self.step_frame(-1))
         self.btn_next = QPushButton(">")
         self.btn_next.clicked.connect(lambda: self.step_frame(1))
 
-        # 設定點
         self.btn_set_in = QPushButton("[ 設定起點")
         self.btn_set_in.setObjectName("TrimBtn")
         self.btn_set_in.clicked.connect(self.set_in_point)
@@ -277,7 +271,6 @@ class MainWindow(QMainWindow):
         self.btn_set_out.setObjectName("TrimBtn")
         self.btn_set_out.clicked.connect(self.set_out_point)
 
-        # 佈局
         btn_area_layout.addWidget(self.play_btn)
         btn_area_layout.addSpacing(10)
         btn_area_layout.addWidget(self.btn_prev)
@@ -329,13 +322,13 @@ class MainWindow(QMainWindow):
         if urls := event.mimeData().urls(): self.load_video(urls[0].toLocalFile())
     
     def select_file(self):
-        if path := QFileDialog.getOpenFileName(self, "選擇影片", "", "Video (*.mp4 *.mov *.avi *.mkv)")[0]:
-            self.load_video(path)
+        # [修正] 分開寫以確保安全
+        file_dialog = QFileDialog.getOpenFileName(self, "選擇影片", "", "Video (*.mp4 *.mov *.avi *.mkv)")
+        if file_dialog and file_dialog[0]:
+            self.load_video(file_dialog[0])
 
     def load_video(self, path):
         if self.cap: self.cap.release()
-        
-        # 停止舊的播放
         if self.is_playing: self.toggle_playback()
 
         self.cap = cv2.VideoCapture(path)
@@ -347,8 +340,7 @@ class MainWindow(QMainWindow):
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
         
-        # UI 更新
-        self.slider.blockSignals(True) # 防止觸發 seek
+        self.slider.blockSignals(True) 
         self.slider.setRange(0, self.total_frames - 1)
         self.slider.setValue(0)
         self.slider.setEnabled(True)
@@ -357,7 +349,6 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(True)
         self.play_btn.setEnabled(True)
         
-        # 重置剪輯點
         self.start_frame = 0
         self.end_frame = self.total_frames - 1
         self.current_frame_idx = 0
@@ -374,26 +365,19 @@ class MainWindow(QMainWindow):
             self.play_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
             self.is_playing = False
         else:
-            # 設定計時器間隔 (毫秒) = 1000 / FPS
             interval = int(1000 / self.fps)
             self.play_timer.start(interval)
             self.play_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
             self.is_playing = True
 
     def next_frame_slot(self):
-        # 這是由 QTimer 觸發的
         next_idx = self.current_frame_idx + 1
-        
-        # 循環邏輯 Check
         limit_frame = self.end_frame
         
         if next_idx > limit_frame:
-            # 如果超過終點，循環回到起點
             next_idx = self.start_frame
-            # 或者是如果要單次播放停止，就呼叫 toggle_playback()
         
         if next_idx >= self.total_frames:
-             # 安全邊界
              next_idx = self.start_frame
 
         self.slider.blockSignals(True)
@@ -402,7 +386,6 @@ class MainWindow(QMainWindow):
         self.seek_video(next_idx)
 
     def on_slider_move(self, val):
-        # 當使用者拖曳時
         self.seek_video(val)
 
     def seek_video(self, frame_idx):
@@ -423,7 +406,6 @@ class MainWindow(QMainWindow):
             )
             self.preview_label.setPixmap(scaled_pixmap)
             
-            # 更新時間
             seconds = frame_idx / self.fps
             time_str = f"{int(seconds//3600):02}:{int((seconds%3600)//60):02}:{seconds%60:05.2f}"
             self.time_label.setText(time_str)
@@ -431,12 +413,10 @@ class MainWindow(QMainWindow):
 
     def step_frame(self, step):
         if not self.cap: return
-        # 暫停播放如果使用者手動介入
         if self.is_playing: self.toggle_playback()
-        
         new_val = self.slider.value() + step
         if 0 <= new_val < self.total_frames:
-            self.slider.setValue(new_val) # 這會觸發 on_slider_move -> seek_video
+            self.slider.setValue(new_val)
 
     def set_in_point(self):
         if not self.cap: return
@@ -510,6 +490,8 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support() # 防止 PyInstaller 多工錯誤
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     w = MainWindow()
