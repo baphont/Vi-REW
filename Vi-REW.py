@@ -9,11 +9,11 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QThread, QObject, Signal, Slot
 from PySide6.QtGui import QColor, QIcon
 
-# --- 導入 MoviePy 與相關套件 ---
-from moviepy import VideoFileClip, concatenate_videoclips
-from moviepy import vfx
-from proglog import ProgressBarLogger 
+# --- [修正 1] 導入 MoviePy 1.0.3 的正確方式 ---
+from moviepy.editor import VideoFileClip, concatenate_videoclips, vfx
+# 注意：imageio_ffmpeg 用來抓取執行檔路徑
 import imageio_ffmpeg 
+from proglog import ProgressBarLogger 
 
 # --- [UI Logger] ---
 class QtLogger(ProgressBarLogger):
@@ -73,68 +73,60 @@ class VideoReverseWorker(QObject):
             if ffmpeg_path is None: raise Exception("找不到 FFmpeg")
             os.environ["FFMPEG_BINARY"] = ffmpeg_path
             
-            # 取得 CPU 核心數
             cpu_cores = os.cpu_count() or 4
             
-            # --- 硬體參數設定 (策略: 畫質好、運算少、速度最快) ---
+            # --- 硬體參數設定 ---
             gpu_type = self.detect_hardware_encoder(ffmpeg_path)
             
             target_codec = ""
             target_preset = ""
             target_params = []
 
+            # [關鍵參數修正] 確保 Windows 可播放 (-pix_fmt yuv420p)
             if gpu_type == "nvidia":
                 self.progress_msg.emit("NVIDIA 極速模式 (P1)")
-                print("[系統訊息] 模式: NVIDIA NVENC P1 (Max Speed)")
+                print("[系統訊息] 模式: NVIDIA NVENC P1")
                 target_codec = "h264_nvenc"
-                
-                # [極速設定]
-                # P1: 最快速度 (幾乎不壓縮)
                 target_preset = "p1" 
-                
-                # 使用 CQP (固定量化參數) 18
-                # 數值越小畫質越好，但檔案越大。18 幾乎是無損，且因為不需計算複雜壓縮，速度極快。
-                target_params = ['-rc', 'constqp', '-qp', '18', '-zerolatency', '1']
+                target_params = ['-rc', 'constqp', '-qp', '18', '-zerolatency', '1', '-pix_fmt', 'yuv420p']
 
             elif gpu_type == "amd":
                 self.progress_msg.emit("AMD 極速模式")
                 target_codec = "h264_amf"
                 target_preset = "speed"
-                # AMD 使用 CQP 模式
-                target_params = ['-rc', 'cqp', '-qp_p', '18', '-qp_i', '18', '-usage', 'ultralowlatency']
+                target_params = ['-rc', 'cqp', '-qp_p', '18', '-qp_i', '18', '-usage', 'ultralowlatency', '-pix_fmt', 'yuv420p']
 
             elif gpu_type == "intel":
                 self.progress_msg.emit("Intel QSV 極速模式")
                 target_codec = "h264_qsv"
                 target_preset = "veryfast"
-                target_params = ['-global_quality', '18']
+                target_params = ['-global_quality', '18', '-pix_fmt', 'yuv420p']
 
             else:
                 self.progress_msg.emit("CPU 極速模式 (Ultrafast)")
                 print("[系統訊息] 模式: CPU Ultrafast")
                 target_codec = "libx264"
-                
-                # [極速設定]
-                # ultrafast: 這是 CPU 編碼的最快檔位，它會放棄大部分壓縮計算，直接寫入。
                 target_preset = "ultrafast" 
-                target_params = ['-crf', '18'] 
+                target_params = ['-crf', '18', '-pix_fmt', 'yuv420p'] 
 
             # --- 處理流程 ---
             self.progress_msg.emit("載入影片...")
             original_clip = VideoFileClip(self.file_path)
             
-            # 安全修剪
+            # [修正 2] 1.0.3 剪輯語法：使用 subclip 而不是 with_section_cut_out
             if original_clip.duration > 0.1:
                 new_duration = original_clip.duration - 0.05
-                original_clip = original_clip.with_section_cut_out(new_duration, original_clip.duration)
+                # 這裡切掉最後 0.05 秒
+                original_clip = original_clip.subclip(0, new_duration)
             
             self.progress_msg.emit("計算倒轉特效...")
-            reversed_clip = original_clip.with_effects([vfx.TimeMirror()])
+            # [修正 3] 1.0.3 特效語法：使用 fx(vfx.time_mirror)
+            reversed_clip = original_clip.fx(vfx.time_mirror)
 
             base_name = os.path.splitext(self.file_path)[0]
             my_logger = QtLogger(self.progress_val, self.progress_msg)
 
-            # 統一寫入函式 (全程使用最速 preset)
+            # 統一寫入函式
             def write_clip(clip, path):
                 clip.write_videofile(
                     path, 
@@ -142,7 +134,7 @@ class VideoReverseWorker(QObject):
                     audio_codec="aac",
                     temp_audiofile=temp_audio_name,
                     remove_temp=True,
-                    threads=cpu_cores, # 全核心運算
+                    threads=cpu_cores,
                     preset=target_preset,
                     ffmpeg_params=target_params,
                     logger=my_logger
@@ -153,6 +145,7 @@ class VideoReverseWorker(QObject):
                 temp_reversed_path = base_name + "_temp_rev.mp4"
                 write_clip(reversed_clip, temp_reversed_path)
                 
+                # 重新讀取暫存檔以進行合併
                 rev_clip_disk = VideoFileClip(temp_reversed_path)
                 
                 self.progress_msg.emit("合併並輸出 (UltraFast)...")
@@ -190,12 +183,12 @@ class VideoReverseWorker(QObject):
                 if original_clip: original_clip.close()
             except: pass
 
-# --- UI (保持不變) ---
+# --- UI 部分 (保持不變) ---
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowIcon(QApplication.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
-        self.setWindowTitle("Vi-REW 1.0 (UltraFast Edition)") # 改個霸氣的名字
+        self.setWindowTitle("Vi-REW 1.0 (Fix Edition)")
         self.setGeometry(100, 100, 600, 480)
         self.setAcceptDrops(True)
         self.thread = None
