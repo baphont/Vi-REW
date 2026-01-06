@@ -1,8 +1,12 @@
 簡單的小工具，不需要另外下載影音剪輯軟體即可直接倒轉影片  
 合併功能：可直接把倒轉後的片段串接起來  
 應用場合：製作首尾幀不間斷的動態背景等等  
-可直接使用python執行，也可下載 [exe]() 檔案  
+可直接使用 python 執行，也可下載 [exe](https://drive.google.com/file/d/1XHepGLBagBd83jGxiEf0-jvElWcpCOm-/view?usp=drive_link) 檔案  
 exe 檔案可能會有系統警告跳出  
 
 不建議使用超過30秒的影片，一般動態背景也不會到那麼長，如需倒轉長片的話還是建議使用剪輯軟體效率更好  
-目前有GPU加速，但本身沒有AMD跟INTEL卡可以測試，如果崩潰請告知
+目前有GPU加速，但本身沒有AMD跟INTEL卡可以測試，如果崩潰請告知  
+
+
+新增 PRO 版本：  
+可以選擇幀數調整所需要的部分 [exe](https://drive.google.com/file/d/1k_4-fNjlU_9wKxdwr6xGweKdLddPHQru/view?usp=drive_link)
