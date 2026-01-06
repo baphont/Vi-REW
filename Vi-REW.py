@@ -204,7 +204,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.info_panel, 1)
 
         options_layout = QHBoxLayout()
-        self.boomerang_check = QCheckBox("串接原檔 (Boomerang 效果)")
+        self.boomerang_check = QCheckBox("串接原檔 (用於製作一些動態背景，可保持首尾幀連貫)")
         self.boomerang_check.setChecked(False) 
         options_layout.addWidget(self.boomerang_check)
         options_layout.addStretch()
